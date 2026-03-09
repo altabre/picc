@@ -87,6 +87,7 @@ pub fn run_claude(
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
+        .arg("--dangerously-skip-permissions")
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
