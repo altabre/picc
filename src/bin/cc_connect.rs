@@ -129,6 +129,22 @@ impl TgBot {
         result.result
     }
 
+    async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str, thread_id: Option<i32>) {
+        #[derive(serde::Serialize)]
+        struct EditParams {
+            chat_id: i64,
+            message_id: i64,
+            text: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message_thread_id: Option<i32>,
+        }
+        let params = EditParams { chat_id, message_id, text: text.to_string(), message_thread_id: thread_id };
+        let _ = self.client
+            .post(self.api_url("editMessageText"))
+            .json(&params)
+            .send().await;
+    }
+
     async fn delete_message(&self, chat_id: i64, message_id: i64) {
         let params = DeleteMessageParams { chat_id, message_id };
         let _ = self.client
@@ -234,23 +250,59 @@ async fn handle_message(
         .map(|s| s.cwd.clone())
         .unwrap_or_else(|| config.approved_directory.clone());
 
-    // 5. Send thinking indicator
-    let thinking = bot.send_message(chat_id, "⏳", msg.message_thread_id).await;
+    // 5. Send initial progress message
+    let progress = bot.send_message(chat_id, "⏳ Thinking...", msg.message_thread_id).await;
+    let progress_id = progress.as_ref().map(|m| m.message_id);
 
-    // 6. Run claude subprocess in blocking thread
+    // 6. Create event channel for streaming progress
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<picc::cc_connect::session::ClaudeEvent>();
+
+    // 7. Spawn progress updater: receives tool events, edits the progress message
+    let bot_progress = Arc::clone(&bot);
+    let thread_id_opt = msg.message_thread_id;
+    let progress_task = tokio::spawn(async move {
+        use picc::cc_connect::session::{ClaudeEvent, tool_icon};
+        let mut tool_lines: Vec<String> = Vec::new();
+        let mut last_edit = std::time::Instant::now();
+
+        while let Some(event) = event_rx.recv().await {
+            if let ClaudeEvent::ToolUse { name, summary } = event {
+                let icon = tool_icon(&name);
+                let line = if summary.is_empty() {
+                    format!("{icon} {name}")
+                } else {
+                    format!("{icon} {name}  `{summary}`")
+                };
+                tool_lines.push(line);
+
+                // Throttle edits to max 1 per second
+                if last_edit.elapsed().as_millis() > 1000 {
+                    if let Some(mid) = progress_id {
+                        let body = tool_lines.iter()
+                            .rev().take(8).rev()  // show last 8 tools
+                            .cloned().collect::<Vec<_>>().join("\n");
+                        let text = format!("⏳ Working...\n\n{body}");
+                        bot_progress.edit_message(chat_id, mid, &text, thread_id_opt).await;
+                        last_edit = std::time::Instant::now();
+                    }
+                }
+            }
+        }
+        tool_lines // return for final display
+    });
+
+    // 8. Run claude subprocess in blocking thread
     let cwd_owned = cwd.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_claude(&text, &cwd_owned, session_id_opt.as_deref())
+        run_claude(&text, &cwd_owned, session_id_opt.as_deref(), Some(event_tx))
     })
     .await
     .unwrap();
 
-    // 7. Delete thinking indicator
-    if let Some(t) = thinking {
-        bot.delete_message(chat_id, t.message_id).await;
-    }
+    // Wait for progress task to drain remaining events
+    let tool_lines = progress_task.await.unwrap_or_default();
 
-    // 8. Send response
+    // 9. Send response
     match result {
         Ok((response, new_session_id)) => {
             let now = std::time::SystemTime::now()
@@ -264,18 +316,24 @@ async fn handle_message(
                 cwd,
                 created_at: existing.map(|s| s.created_at).unwrap_or(now),
             });
-            bot.send_message(
-                chat_id,
-                &formatter::format_response(&response),
-                msg.message_thread_id,
-            ).await;
+
+            // Build final message: tool summary + response
+            let reply_text = formatter::format_response(&response, &tool_lines);
+
+            // Edit progress message into final response (no flash/delete)
+            if let Some(mid) = progress_id {
+                bot.edit_message(chat_id, mid, &reply_text, msg.message_thread_id).await;
+            } else {
+                bot.send_message(chat_id, &reply_text, msg.message_thread_id).await;
+            }
         }
         Err(e) => {
-            bot.send_message(
-                chat_id,
-                &formatter::format_error(&e),
-                msg.message_thread_id,
-            ).await;
+            let err_text = formatter::format_error(&e);
+            if let Some(mid) = progress_id {
+                bot.edit_message(chat_id, mid, &err_text, msg.message_thread_id).await;
+            } else {
+                bot.send_message(chat_id, &err_text, msg.message_thread_id).await;
+            }
         }
     }
 }
