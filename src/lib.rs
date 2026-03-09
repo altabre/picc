@@ -1,6 +1,7 @@
 pub mod accessibility;
 pub mod actions;
 pub mod avfaudio;
+pub mod cc_connect;
 pub mod core_graphics;
 pub mod error;
 pub mod iframe_inject;

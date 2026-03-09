@@ -56,6 +56,10 @@ required-features = ["sensevoice"]
 name = "voice-correct"
 path = "src/bin/voice_correct.rs"
 
+[[bin]]
+name = "cc-connect"
+path = "src/bin/cc_connect.rs"
+
 [dependencies]
 objc2 = "0.6.4"
 block2 = "0.6.2"
@@ -169,6 +173,12 @@ tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] 
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
 rand = "0.8"
 urlencoding = "2"
+teloxide = { version = "0.13", features = ["macros", "throttle"] }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+dotenvy = "0.15"
+pretty_env_logger = "0.5"
+log = "0.4"
 sherpa-rs = { version = "0.6", default-features = false, features = ["static"], optional = true }
 
 [features]
