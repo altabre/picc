@@ -61,17 +61,6 @@ struct DeleteMessageParams {
     message_id: i64,
 }
 
-/// Telegram Bot API 9.3+ — native streaming draft
-/// Same draft_id repeated → Telegram client shows smooth animation
-#[derive(Debug, Serialize)]
-struct SendMessageDraftParams {
-    chat_id: i64,
-    draft_id: i64,
-    text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message_thread_id: Option<i32>,
-}
-
 // --- Telegram API client ---
 
 struct TgBot {
@@ -162,22 +151,6 @@ impl TgBot {
         let params = EditParams { chat_id, message_id, text: text.to_string(), message_thread_id: thread_id };
         let _ = self.client
             .post(self.api_url("editMessageText"))
-            .json(&params)
-            .send().await;
-    }
-
-    /// sendMessageDraft: Bot API 9.3+ streaming API.
-    /// Using the same draft_id repeatedly triggers native Telegram client animation.
-    /// Much smoother than editMessageText for streaming updates.
-    async fn send_draft(&self, chat_id: i64, draft_id: i64, text: &str, thread_id: Option<i32>) {
-        let params = SendMessageDraftParams {
-            chat_id,
-            draft_id,
-            text: text.to_string(),
-            message_thread_id: thread_id,
-        };
-        let _ = self.client
-            .post(self.api_url("sendMessageDraft"))
             .json(&params)
             .send().await;
     }
@@ -295,18 +268,14 @@ async fn handle_message(
         .map(|s| s.cwd.clone())
         .unwrap_or_else(|| config.approved_directory.clone());
 
-    // 5. Generate a unique draft_id for sendMessageDraft streaming
-    // Using same draft_id repeatedly → Telegram client shows native smooth animation
-    let draft_id = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
-        ((chat_id.abs() % 100_000) * 100_000 + ns as i64 % 100_000).max(1)
-    };
+    // 5. Send initial progress message and get its ID for editing
+    let progress_msg = bot.send_message(chat_id, "⏳ Working...", msg.message_thread_id).await;
+    let progress_msg_id = progress_msg.map(|m| m.message_id);
 
     // 6. Create event channel for streaming progress
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<picc::cc_connect::session::ClaudeEvent>();
 
-    // 7. Spawn progress updater — uses sendMessageDraft for smooth streaming
+    // 7. Spawn progress updater — edits the progress message every 300ms
     let bot_progress = Arc::clone(&bot);
     let thread_id_opt = msg.message_thread_id;
     let progress_task = tokio::spawn(async move {
@@ -352,19 +321,19 @@ async fn handle_message(
             if let Some(l) = line {
                 progress_lines.push(l);
 
-                // PreText triggers immediate send; others throttled to 300ms (matches Python)
+                // Throttle to 300ms to avoid Telegram rate limits
                 let force = matches!(event, ClaudeEvent::PreText(_));
                 if force || last_send.elapsed().as_millis() > 300 {
-                    let body = progress_lines.iter()
-                        .rev().take(10).rev()
-                        .cloned().collect::<Vec<_>>().join("\n");
-                    let draft_text = format!("⏳ Working...\n\n{body}");
-                    let draft_text = if draft_text.len() > 3800 {
-                        format!("{}…", &draft_text[..3800])
-                    } else { draft_text };
-
-                    // sendMessageDraft: same draft_id → smooth native animation
-                    bot_progress.send_draft(chat_id, draft_id, &draft_text, thread_id_opt).await;
+                    if let Some(mid) = progress_msg_id {
+                        let body = progress_lines.iter()
+                            .rev().take(10).rev()
+                            .cloned().collect::<Vec<_>>().join("\n");
+                        let progress_text = format!("⏳ Working...\n\n{body}");
+                        let progress_text = if progress_text.len() > 3800 {
+                            format!("{}…", &progress_text[..3800])
+                        } else { progress_text };
+                        bot_progress.edit_message(chat_id, mid, &progress_text, thread_id_opt).await;
+                    }
                     last_send = std::time::Instant::now();
                 }
             }
@@ -398,11 +367,17 @@ async fn handle_message(
                 created_at: existing.map(|s| s.created_at).unwrap_or(now),
             });
 
-            // Send final response as a new message (draft disappears automatically)
+            // Delete progress message, send final response
+            if let Some(mid) = progress_msg_id {
+                bot.delete_message(chat_id, mid).await;
+            }
             let reply_text = formatter::format_response(&response, &tool_lines);
             bot.send_message(chat_id, &reply_text, msg.message_thread_id).await;
         }
         Err(e) => {
+            if let Some(mid) = progress_msg_id {
+                bot.delete_message(chat_id, mid).await;
+            }
             bot.send_message(chat_id, &formatter::format_error(&e), msg.message_thread_id).await;
         }
     }
