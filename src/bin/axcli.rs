@@ -288,6 +288,58 @@ Known attributes:
         #[arg(long)]
         all: bool,
     },
+    /// Click at absolute screen coordinates (no AX locator needed)
+    ///
+    /// Useful for Electron apps (Telegram, VS Code) where the AX tree
+    /// doesn't expose all UI elements. Combine with `ocr-find` to locate
+    /// coordinates first.
+    ///
+    /// Examples:
+    ///   axcli click-at 350 420
+    ///   axcli --app Telegram click-at 180 310
+    ClickAt {
+        /// X coordinate in screen points
+        x: f64,
+        /// Y coordinate in screen points
+        y: f64,
+    },
+
+    /// Find text in the app window via OCR and click on it
+    ///
+    /// Takes a screenshot of the app window, runs Vision OCR, finds the
+    /// element whose text best matches the query, then clicks its center.
+    /// Uses case-insensitive substring matching.
+    ///
+    /// Best for Electron apps where AX tree is shallow (Telegram sidebar,
+    /// VS Code panels, etc.).
+    ///
+    /// Examples:
+    ///   axcli --app Telegram ocr-click "General"
+    ///   axcli --app Telegram ocr-click "Coder_Bot" --index 1
+    OcrClick {
+        /// Text to search for (case-insensitive substring)
+        text: String,
+        /// If multiple matches, pick this index (0-based, default 0)
+        #[arg(long, default_value = "0")]
+        index: usize,
+        /// Minimum confidence threshold (0.0–1.0, default 0.3)
+        #[arg(long, default_value = "0.3")]
+        min_confidence: f64,
+    },
+
+    /// Find text in the app window via OCR and print screen coordinates
+    ///
+    /// Prints OCR matches as: `x,y,w,h<TAB>conf<TAB>text` (screen points).
+    /// Useful for debugging before using `ocr-click`.
+    ///
+    /// Examples:
+    ///   axcli --app Telegram ocr-find "General"
+    ///   axcli --app Telegram ocr-find ""   # dump all OCR results
+    OcrFind {
+        /// Text filter (case-insensitive substring, empty = show all)
+        text: String,
+    },
+
     /// List running applications visible to accessibility
     ListApps,
 }
@@ -301,6 +353,15 @@ fn main() {
             eprintln!("error: {e}");
             std::process::exit(exit_code(&e));
         }
+        return;
+    }
+
+    // click-at doesn't need --app/--pid either
+    if let Command::ClickAt { x, y } = cli.command {
+        eprintln!("Clicking at ({x:.0}, {y:.0})");
+        input::mouse_move(x, y);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        input::mouse_click(x, y);
         return;
     }
 
@@ -340,6 +401,11 @@ fn run(cli: Cli) -> Result<(), AxError> {
         }
         Command::Wait { target } => cmd_wait(&ctx, &target),
         Command::Get { attr, locator, all } => cmd_get(&ctx, &attr, &locator, all),
+        Command::ClickAt { .. } => unreachable!(), // handled in main()
+        Command::OcrClick { text, index, min_confidence } => {
+            cmd_ocr_click(&ctx, &text, index, min_confidence)
+        }
+        Command::OcrFind { text } => cmd_ocr_find(&ctx, &text),
     }
 }
 
@@ -980,5 +1046,118 @@ fn cmd_get(ctx: &ExecutionContext, attr: &GetAttr, locator: &str, all: bool) -> 
             println!();
         }
     }
+    Ok(())
+}
+
+// --- OCR helpers ---
+
+/// Get the window rect (screen coords) for the app's main visible window.
+fn app_window_rect(ctx: &ExecutionContext) -> Option<(f64, f64, f64, f64)> {
+    let windows = ctx.app.children();
+    for win in &windows {
+        if win.role().as_deref() != Some("AXWindow") { continue; }
+        if let (Some((x, y)), Some((w, h))) = (win.position(), win.size()) {
+            if w > 0.0 && h > 0.0 {
+                return Some((x, y, w, h));
+            }
+        }
+    }
+    None
+}
+
+/// Run OCR on the app window and return results with screen-space coordinates.
+/// Each item: (screen_cx, screen_cy, screen_w, screen_h, confidence, text)
+fn ocr_window(ctx: &ExecutionContext) -> Result<Vec<(f64, f64, f64, f64, f64, String)>, AxError> {
+    screenshot::ensure_cg_init();
+
+    // Capture window via ScreenCaptureKit (background, no focus change)
+    let win_image = if let Some(img) = picc::screen_capture::capture_window_by_pid(ctx.pid) {
+        img
+    } else {
+        // Fallback: activate + legacy capture
+        ctx.activate();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let (x, y, w, h) = app_window_rect(ctx)
+            .ok_or_else(|| AxError::ScreenshotFailed("no window found".to_string()))?;
+        let rect = CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+        screenshot::capture(rect)
+            .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?
+    };
+
+    // OCR the image
+    let ocr_results = picc::vision::ocr_with_boxes(&win_image);
+    if ocr_results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Get window position in screen points for coordinate conversion
+    let (win_x, win_y, win_w, win_h) = app_window_rect(ctx).unwrap_or((0.0, 0.0, 1920.0, 1080.0));
+
+    // Convert Vision normalized coords (y-up, origin bottom-left) → screen points
+    let mut out = Vec::new();
+    for r in ocr_results {
+        // Center of bounding box in screen points
+        let cx = win_x + (r.x + r.w / 2.0) * win_w;
+        let cy = win_y + (1.0 - r.y - r.h / 2.0) * win_h;
+        let sw = r.w * win_w;
+        let sh = r.h * win_h;
+        out.push((cx, cy, sw, sh, r.confidence, r.text));
+    }
+    Ok(out)
+}
+
+fn cmd_ocr_find(ctx: &ExecutionContext, query: &str) -> Result<(), AxError> {
+    let results = ocr_window(ctx)?;
+    let query_lower = query.to_lowercase();
+
+    let mut count = 0;
+    for (cx, cy, sw, sh, conf, text) in &results {
+        if query.is_empty() || text.to_lowercase().contains(&query_lower) {
+            println!("{:.0},{:.0},{:.0},{:.0}\t{:.2}\t{}", cx, cy, sw, sh, conf, text);
+            count += 1;
+        }
+    }
+    eprintln!("({} results, {} total OCR tokens)", count, results.len());
+    Ok(())
+}
+
+fn cmd_ocr_click(
+    ctx: &ExecutionContext,
+    query: &str,
+    index: usize,
+    min_confidence: f64,
+) -> Result<(), AxError> {
+    let results = ocr_window(ctx)?;
+    let query_lower = query.to_lowercase();
+
+    let matches: Vec<_> = results
+        .iter()
+        .filter(|(_, _, _, _, conf, text)| {
+            *conf >= min_confidence && text.to_lowercase().contains(&query_lower)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        return Err(AxError::LocatorNotFound(format!("ocr:{query}")));
+    }
+    if index >= matches.len() {
+        return Err(AxError::InvalidArgument(format!(
+            "--index {index} out of range ({} matches found)",
+            matches.len()
+        )));
+    }
+
+    let (cx, cy, _, _, conf, text) = matches[index];
+    eprintln!(
+        "OCR match {}/{}: {:?} (conf={:.2}) → clicking ({:.0}, {:.0})",
+        index + 1, matches.len(), text, conf, cx, cy
+    );
+
+    // Activate app first, then click
+    ctx.activate();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    input::mouse_move(*cx, *cy);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    input::mouse_click(*cx, *cy);
     Ok(())
 }
