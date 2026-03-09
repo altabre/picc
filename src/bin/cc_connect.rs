@@ -102,8 +102,18 @@ impl TgBot {
             Ok(r) => r,
             Err(e) => { log::warn!("getUpdates parse error: {e}"); return vec![]; }
         };
-        if result.ok { result.result.unwrap_or_default() } else {
-            log::warn!("getUpdates failed: {:?}", result.description);
+        if result.ok {
+            result.result.unwrap_or_default()
+        } else {
+            let desc = result.description.as_deref().unwrap_or("");
+            if desc.contains("Conflict") {
+                // Another instance has an active long-poll; wait for it to expire
+                log::warn!("getUpdates conflict — waiting 35s for previous request to expire...");
+                tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            } else {
+                log::warn!("getUpdates failed: {:?}", result.description);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
             vec![]
         }
     }
@@ -178,12 +188,20 @@ async fn main() {
     let mut offset: i64 = 0;
 
     loop {
-        let updates = bot.get_updates(offset, 30).await;
+        let updates = bot.get_updates(offset, 5).await;
 
         for update in updates {
             offset = update.update_id + 1;
 
             if let Some(msg) = update.message {
+                // Debug: log every incoming message before any filtering
+                log::debug!(
+                    "raw msg: chat={} thread={:?} user={:?} text={:?}",
+                    msg.chat.id,
+                    msg.message_thread_id,
+                    msg.from.as_ref().map(|u| u.id),
+                    msg.text.as_deref().map(|t| &t[..t.len().min(40)])
+                );
                 let bot = Arc::clone(&bot);
                 let config = Arc::clone(&config);
                 let store = Arc::clone(&store);
@@ -262,33 +280,73 @@ async fn handle_message(
     let thread_id_opt = msg.message_thread_id;
     let progress_task = tokio::spawn(async move {
         use picc::cc_connect::session::{ClaudeEvent, tool_icon};
+
+        // Lines shown in the progress message (tool calls, results, pre-text)
+        let mut progress_lines: Vec<String> = Vec::new();
+        // Tool lines only for final message header
         let mut tool_lines: Vec<String> = Vec::new();
         let mut last_edit = std::time::Instant::now();
 
-        while let Some(event) = event_rx.recv().await {
-            if let ClaudeEvent::ToolUse { name, summary } = event {
-                let icon = tool_icon(&name);
-                let line = if summary.is_empty() {
-                    format!("{icon} {name}")
-                } else {
-                    format!("{icon} {name}  `{summary}`")
-                };
-                tool_lines.push(line);
+        let do_edit = |lines: &Vec<String>, mid: i64, bot: &Arc<TgBot>| {
+            let _ = (lines, mid, bot); // capture hint
+        };
+        let _ = do_edit; // suppress unused warning
 
-                // Throttle edits to max 1 per second
-                if last_edit.elapsed().as_millis() > 1000 {
+        while let Some(event) = event_rx.recv().await {
+            let line = match event {
+                ClaudeEvent::ToolUse { ref name, ref summary } => {
+                    let icon = tool_icon(name);
+                    let l = if summary.is_empty() {
+                        format!("{icon} **{name}**")
+                    } else {
+                        format!("{icon} **{name}**  `{summary}`")
+                    };
+                    tool_lines.push(l.clone());
+                    Some(l)
+                }
+                ClaudeEvent::ToolResult(ref output) => {
+                    // Show result indented under the tool
+                    Some(format!("```\n{output}\n```"))
+                }
+                ClaudeEvent::PreText(ref text) => {
+                    // Claude's reasoning text before calling tools — show immediately
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() { None }
+                    else {
+                        // Show up to 200 chars of reasoning
+                        let display = if trimmed.len() > 200 {
+                            format!("{}…", &trimmed[..200])
+                        } else {
+                            trimmed.to_string()
+                        };
+                        Some(format!("💭 {display}"))
+                    }
+                }
+                ClaudeEvent::TextDelta(_) => None,
+            };
+
+            if let Some(l) = line {
+                progress_lines.push(l);
+
+                // PreText (Claude's reasoning): update immediately, no throttle
+                // Other events: throttle to 500ms
+                let force_update = matches!(event, ClaudeEvent::PreText(_));
+                if force_update || last_edit.elapsed().as_millis() > 500 {
                     if let Some(mid) = progress_id {
-                        let body = tool_lines.iter()
-                            .rev().take(8).rev()  // show last 8 tools
+                        // Show last 10 lines in progress message
+                        let body = progress_lines.iter()
+                            .rev().take(10).rev()
                             .cloned().collect::<Vec<_>>().join("\n");
                         let text = format!("⏳ Working...\n\n{body}");
+                        // Truncate to Telegram limit
+                        let text = if text.len() > 3800 { format!("{}…", &text[..3800]) } else { text };
                         bot_progress.edit_message(chat_id, mid, &text, thread_id_opt).await;
                         last_edit = std::time::Instant::now();
                     }
                 }
             }
         }
-        tool_lines // return for final display
+        (tool_lines, progress_lines)
     });
 
     // 8. Run claude subprocess in blocking thread
@@ -300,7 +358,7 @@ async fn handle_message(
     .unwrap();
 
     // Wait for progress task to drain remaining events
-    let tool_lines = progress_task.await.unwrap_or_default();
+    let (tool_lines, _progress_lines) = progress_task.await.unwrap_or_default();
 
     // 9. Send response
     match result {

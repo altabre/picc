@@ -6,7 +6,11 @@ use std::process::{Command, Stdio};
 pub enum ClaudeEvent {
     /// Claude used a tool (e.g. Read, Bash, Write)
     ToolUse { name: String, summary: String },
-    /// Streaming text from Claude's response
+    /// Tool execution result (output of Bash, Read, etc.)
+    ToolResult(String),
+    /// Text Claude writes between tool calls (pre-answer reasoning)
+    PreText(String),
+    /// Final text response
     TextDelta(String),
 }
 
@@ -128,13 +132,24 @@ pub fn run_claude(
         match v["type"].as_str().unwrap_or("") {
             "assistant" => {
                 if let Some(content) = v["message"]["content"].as_array() {
+                    let mut has_tool = content.iter().any(|b| b["type"] == "tool_use");
                     for block in content {
                         match block["type"].as_str().unwrap_or("") {
                             "text" => {
                                 if let Some(text) = block["text"].as_str() {
-                                    full_text.push_str(text);
-                                    if let Some(tx) = &event_tx {
-                                        let _ = tx.send(ClaudeEvent::TextDelta(text.to_string()));
+                                    if !text.trim().is_empty() {
+                                        if has_tool {
+                                            // Text before tool calls = Claude's reasoning
+                                            if let Some(tx) = &event_tx {
+                                                let _ = tx.send(ClaudeEvent::PreText(text.to_string()));
+                                            }
+                                        } else {
+                                            // Text after all tools = final answer
+                                            full_text.push_str(text);
+                                            if let Some(tx) = &event_tx {
+                                                let _ = tx.send(ClaudeEvent::TextDelta(text.to_string()));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -144,8 +159,39 @@ pub fn run_claude(
                                     let summary = summarize_input(&name, &block["input"]);
                                     let _ = tx.send(ClaudeEvent::ToolUse { name, summary });
                                 }
+                                has_tool = false; // text after this is post-tool
                             }
                             _ => {}
+                        }
+                    }
+                }
+            }
+            "user" => {
+                // Tool results
+                if let Some(tx) = &event_tx {
+                    if let Some(content) = v["message"]["content"].as_array() {
+                        for block in content {
+                            if block["type"] == "tool_result" {
+                                let result_text = if let Some(arr) = block["content"].as_array() {
+                                    arr.iter()
+                                        .filter(|c| c["type"] == "text")
+                                        .filter_map(|c| c["text"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                } else {
+                                    block["content"].as_str().unwrap_or("").to_string()
+                                };
+                                if !result_text.trim().is_empty() {
+                                    let trimmed = result_text.trim();
+                                    // Truncate long results
+                                    let display = if trimmed.len() > 300 {
+                                        format!("{}…", &trimmed[..300])
+                                    } else {
+                                        trimmed.to_string()
+                                    };
+                                    let _ = tx.send(ClaudeEvent::ToolResult(display));
+                                }
+                            }
                         }
                     }
                 }
