@@ -177,6 +177,7 @@ teloxide = { version = "0.13", features = ["macros", "throttle"] }
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 dotenvy = "0.15"
+toml = "0.8"
 pretty_env_logger = "0.5"
 log = "0.4"
 sherpa-rs = { version = "0.6", default-features = false, features = ["static"], optional = true }
