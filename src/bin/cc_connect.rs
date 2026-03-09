@@ -61,6 +61,17 @@ struct DeleteMessageParams {
     message_id: i64,
 }
 
+/// Telegram Bot API 9.3+ — native streaming draft
+/// Same draft_id repeated → Telegram client shows smooth animation
+#[derive(Debug, Serialize)]
+struct SendMessageDraftParams {
+    chat_id: i64,
+    draft_id: i64,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_thread_id: Option<i32>,
+}
+
 // --- Telegram API client ---
 
 struct TgBot {
@@ -151,6 +162,22 @@ impl TgBot {
         let params = EditParams { chat_id, message_id, text: text.to_string(), message_thread_id: thread_id };
         let _ = self.client
             .post(self.api_url("editMessageText"))
+            .json(&params)
+            .send().await;
+    }
+
+    /// sendMessageDraft: Bot API 9.3+ streaming API.
+    /// Using the same draft_id repeatedly triggers native Telegram client animation.
+    /// Much smoother than editMessageText for streaming updates.
+    async fn send_draft(&self, chat_id: i64, draft_id: i64, text: &str, thread_id: Option<i32>) {
+        let params = SendMessageDraftParams {
+            chat_id,
+            draft_id,
+            text: text.to_string(),
+            message_thread_id: thread_id,
+        };
+        let _ = self.client
+            .post(self.api_url("sendMessageDraft"))
             .json(&params)
             .send().await;
     }
@@ -268,57 +295,54 @@ async fn handle_message(
         .map(|s| s.cwd.clone())
         .unwrap_or_else(|| config.approved_directory.clone());
 
-    // 5. Send initial progress message
-    let progress = bot.send_message(chat_id, "⏳ Thinking...", msg.message_thread_id).await;
-    let progress_id = progress.as_ref().map(|m| m.message_id);
+    // 5. Generate a unique draft_id for sendMessageDraft streaming
+    // Using same draft_id repeatedly → Telegram client shows native smooth animation
+    let draft_id = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+        ((chat_id.abs() % 100_000) * 100_000 + ns as i64 % 100_000).max(1)
+    };
 
     // 6. Create event channel for streaming progress
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<picc::cc_connect::session::ClaudeEvent>();
 
-    // 7. Spawn progress updater: receives tool events, edits the progress message
+    // 7. Spawn progress updater — uses sendMessageDraft for smooth streaming
     let bot_progress = Arc::clone(&bot);
     let thread_id_opt = msg.message_thread_id;
     let progress_task = tokio::spawn(async move {
         use picc::cc_connect::session::{ClaudeEvent, tool_icon};
 
-        // Lines shown in the progress message (tool calls, results, pre-text)
         let mut progress_lines: Vec<String> = Vec::new();
-        // Tool lines only for final message header
         let mut tool_lines: Vec<String> = Vec::new();
-        let mut last_edit = std::time::Instant::now();
-
-        let do_edit = |lines: &Vec<String>, mid: i64, bot: &Arc<TgBot>| {
-            let _ = (lines, mid, bot); // capture hint
-        };
-        let _ = do_edit; // suppress unused warning
+        let mut last_send = std::time::Instant::now();
 
         while let Some(event) = event_rx.recv().await {
             let line = match event {
                 ClaudeEvent::ToolUse { ref name, ref summary } => {
                     let icon = tool_icon(name);
                     let l = if summary.is_empty() {
-                        format!("{icon} **{name}**")
+                        format!("{icon} {name}")
                     } else {
-                        format!("{icon} **{name}**  `{summary}`")
+                        format!("{icon} {name}  `{summary}`")
                     };
                     tool_lines.push(l.clone());
                     Some(l)
                 }
                 ClaudeEvent::ToolResult(ref output) => {
-                    // Show result indented under the tool
-                    Some(format!("```\n{output}\n```"))
+                    let first_line = output.lines().next().unwrap_or("").trim();
+                    if first_line.is_empty() { None }
+                    else {
+                        let short = if first_line.len() > 80 { format!("{}…", &first_line[..80]) }
+                                    else { first_line.to_string() };
+                        Some(format!("  → {short}"))
+                    }
                 }
                 ClaudeEvent::PreText(ref text) => {
-                    // Claude's reasoning text before calling tools — show immediately
                     let trimmed = text.trim();
                     if trimmed.is_empty() { None }
                     else {
-                        // Show up to 200 chars of reasoning
-                        let display = if trimmed.len() > 200 {
-                            format!("{}…", &trimmed[..200])
-                        } else {
-                            trimmed.to_string()
-                        };
+                        let display = if trimmed.len() > 150 { format!("{}…", &trimmed[..150]) }
+                                      else { trimmed.to_string() };
                         Some(format!("💭 {display}"))
                     }
                 }
@@ -328,21 +352,20 @@ async fn handle_message(
             if let Some(l) = line {
                 progress_lines.push(l);
 
-                // PreText (Claude's reasoning): update immediately, no throttle
-                // Other events: throttle to 500ms
-                let force_update = matches!(event, ClaudeEvent::PreText(_));
-                if force_update || last_edit.elapsed().as_millis() > 500 {
-                    if let Some(mid) = progress_id {
-                        // Show last 10 lines in progress message
-                        let body = progress_lines.iter()
-                            .rev().take(10).rev()
-                            .cloned().collect::<Vec<_>>().join("\n");
-                        let text = format!("⏳ Working...\n\n{body}");
-                        // Truncate to Telegram limit
-                        let text = if text.len() > 3800 { format!("{}…", &text[..3800]) } else { text };
-                        bot_progress.edit_message(chat_id, mid, &text, thread_id_opt).await;
-                        last_edit = std::time::Instant::now();
-                    }
+                // PreText triggers immediate send; others throttled to 300ms (matches Python)
+                let force = matches!(event, ClaudeEvent::PreText(_));
+                if force || last_send.elapsed().as_millis() > 300 {
+                    let body = progress_lines.iter()
+                        .rev().take(10).rev()
+                        .cloned().collect::<Vec<_>>().join("\n");
+                    let draft_text = format!("⏳ Working...\n\n{body}");
+                    let draft_text = if draft_text.len() > 3800 {
+                        format!("{}…", &draft_text[..3800])
+                    } else { draft_text };
+
+                    // sendMessageDraft: same draft_id → smooth native animation
+                    bot_progress.send_draft(chat_id, draft_id, &draft_text, thread_id_opt).await;
+                    last_send = std::time::Instant::now();
                 }
             }
         }
@@ -375,23 +398,12 @@ async fn handle_message(
                 created_at: existing.map(|s| s.created_at).unwrap_or(now),
             });
 
-            // Build final message: tool summary + response
+            // Send final response as a new message (draft disappears automatically)
             let reply_text = formatter::format_response(&response, &tool_lines);
-
-            // Edit progress message into final response (no flash/delete)
-            if let Some(mid) = progress_id {
-                bot.edit_message(chat_id, mid, &reply_text, msg.message_thread_id).await;
-            } else {
-                bot.send_message(chat_id, &reply_text, msg.message_thread_id).await;
-            }
+            bot.send_message(chat_id, &reply_text, msg.message_thread_id).await;
         }
         Err(e) => {
-            let err_text = formatter::format_error(&e);
-            if let Some(mid) = progress_id {
-                bot.edit_message(chat_id, mid, &err_text, msg.message_thread_id).await;
-            } else {
-                bot.send_message(chat_id, &err_text, msg.message_thread_id).await;
-            }
+            bot.send_message(chat_id, &formatter::format_error(&e), msg.message_thread_id).await;
         }
     }
 }
