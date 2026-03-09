@@ -15,10 +15,13 @@ pub fn run_claude(
         .arg(message)
         .arg("--output-format")
         .arg("stream-json")
-        .arg("--no-color")
+        .arg("--verbose")
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        // Unset CLAUDECODE so claude doesn't refuse to run inside another session
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT");
 
     if let Some(sid) = session_id {
         cmd.arg("--resume").arg(sid);
@@ -28,7 +31,16 @@ pub fn run_claude(
         .spawn()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let reader = BufReader::new(stdout);
+
+    // Drain stderr in background thread so it doesn't block
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in BufReader::new(stderr).lines().flatten() {
+            eprintln!("[claude stderr] {line}");
+        }
+    });
 
     let mut full_text = String::new();
     let mut last_session_id = String::new();

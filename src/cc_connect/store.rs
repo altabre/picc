@@ -65,6 +65,15 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn delete(&self, chat_id: i64, thread_id: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM topic_sessions WHERE chat_id=?1 AND thread_id=?2",
+            params![chat_id, thread_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_all(&self) -> Vec<TopicSession> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
