@@ -152,7 +152,12 @@ async fn main() {
 
     // Clear any existing webhook so long-polling works cleanly
     bot.delete_webhook().await;
-    log::info!("cc-connect bot started (polling mode)");
+    if config.allowed_topics.is_empty() {
+        log::info!("cc-connect started — listening to ALL topics");
+    } else {
+        let topics: Vec<_> = config.allowed_topics.iter().collect();
+        log::info!("cc-connect started — allowed topics: {:?}", topics);
+    }
 
     let mut offset: i64 = 0;
 
@@ -182,7 +187,7 @@ async fn handle_message(
 ) {
     // 1. Only respond to allowed users
     let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
-    if !config.is_allowed(user_id) {
+    if !config.is_allowed_user(user_id) {
         return;
     }
 
@@ -193,6 +198,12 @@ async fn handle_message(
 
     let chat_id = msg.chat.id;
     let thread_id = msg.message_thread_id.unwrap_or(0);
+
+    // 2. Only respond to allowed topics (if configured)
+    if !config.is_allowed_topic(thread_id) {
+        log::debug!("ignoring thread={thread_id} (not in ALLOWED_TOPICS)");
+        return;
+    }
 
     log::info!("msg chat={chat_id} thread={thread_id} user={user_id}: {text:?}");
 
